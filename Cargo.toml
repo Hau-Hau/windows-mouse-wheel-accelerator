@@ -1,5 +1,5 @@
 [package]
-name = "windows-mouse-scroll-accelerator"
+name = "windows-mouse-wheel-accelerator"
 version = "0.1.0"
 edition = "2021"
 
