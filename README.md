@@ -80,6 +80,6 @@ Values of ignoredProcesses and ignoredClassPatterns don't have to be specified e
     "maxInertiaMomentum": 9.0,
     "inertiaEnabled": true,
     "gameModeDetectionEnabled": true,
-    "gameModeDetectionExcludedProcesses": [],
+    "gameModeDetectionExcludedProcesses": []
 }
 ```
