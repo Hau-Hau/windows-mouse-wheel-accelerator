@@ -53,6 +53,12 @@ struct Config {
     inertia_accumulation_factor: Option<f64>,
     #[serde(rename = "maxInertiaMomentum")]
     max_inertia_momentum: Option<f64>,
+    #[serde(rename = "inertiaEnabled")]
+    inertia_enabled: Option<bool>,
+    #[serde(rename = "gameModeDetectionEnabled")]
+    game_mode_detection_enabled: Option<bool>,
+    #[serde(rename = "gameModeDetectionExcludedProcesses")]
+    game_mode_detection_excluded_processes: Option<Vec<String>>,
 }
 
 struct IgnoredClassPattern {
@@ -109,6 +115,9 @@ struct AppConfig {
     min_momentum_for_inertia: f64,
     inertia_accumulation_factor: f64,
     max_inertia_momentum: f64,
+    inertia_enabled: bool,
+    game_mode_detection_enabled: bool,
+    game_mode_detection_excluded_processes: Option<Vec<String>>,
 }
 
 impl Default for AppConfig {
@@ -131,6 +140,9 @@ impl Default for AppConfig {
             min_momentum_for_inertia: 0.5,
             inertia_accumulation_factor: 1.5,
             max_inertia_momentum: 9.0,
+            inertia_enabled: true,
+            game_mode_detection_enabled: true,
+            game_mode_detection_excluded_processes: None,
         }
     }
 }
@@ -262,6 +274,31 @@ fn load_config() -> AppConfig {
                         if let Some(val) = loaded_config.max_inertia_momentum {
                             config.max_inertia_momentum = val;
                             println!("max_inertia_momentum: {}", config.max_inertia_momentum);
+                        }
+
+                        if let Some(val) = loaded_config.inertia_enabled {
+                            config.inertia_enabled = val;
+                            println!("inertia_enabled: {}", config.inertia_enabled);
+                        }
+
+                        if let Some(val) = loaded_config.game_mode_detection_enabled {
+                            config.game_mode_detection_enabled = val;
+                            println!(
+                                "game_mode_detection_enabled: {}",
+                                config.game_mode_detection_enabled
+                            );
+                        }
+
+                        if let Some(game_mode_detection_excluded_processes) =
+                            loaded_config.game_mode_detection_excluded_processes
+                        {
+                            config.game_mode_detection_excluded_processes =
+                                Some(game_mode_detection_excluded_processes.clone());
+
+                            println!(
+                                "game_mode_detection_excluded_processes: {}",
+                                game_mode_detection_excluded_processes.join(", ")
+                            );
                         }
                     }
                     Err(e) => {
@@ -566,44 +603,14 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
     }
 
     let config = CONFIG.get().unwrap();
-    let mut process_id = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-    if process_id != 0 {
-        let process_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+    if let Some(process_name) = get_process_name(hwnd) {
+        if config
+            .ignored_processes
+            .iter()
+            .any(|p| p.to_lowercase() == process_name)
         {
-            Ok(handle) => handle,
-            Err(_) => {
-                cache_window_result(hwnd, false);
-                return false;
-            }
-        };
-
-        let mut exe_path = [0u16; 260];
-        let mut size = exe_path.len() as u32;
-
-        let process_check_result = if QueryFullProcessImageNameW(
-            process_handle,
-            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
-            PWSTR(exe_path.as_mut_ptr()),
-            &mut size,
-        )
-        .is_ok()
-        {
-            let path = String::from_utf16_lossy(&exe_path[..size as usize]);
-            let filename = path.split('\\').last().unwrap_or("").to_lowercase();
-
-            config
-                .ignored_processes
-                .iter()
-                .any(|p| p.to_lowercase() == filename)
-        } else {
-            false
-        };
-
-        let _ = CloseHandle(process_handle);
-        if process_check_result {
-            cache_window_result(hwnd, process_check_result);
-            return process_check_result;
+            cache_window_result(hwnd, true);
+            return true;
         }
     }
 
@@ -644,6 +651,46 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
     false
 }
 
+unsafe fn get_process_name(hwnd: HWND) -> Option<String> {
+    let mut process_id = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    if process_id == 0 {
+        return None;
+    }
+
+    let process_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) {
+        Ok(handle) => handle,
+        Err(_) => {
+            return None;
+        }
+    };
+
+    let mut exe_path = [0u16; 260];
+    let mut size = exe_path.len() as u32;
+
+    let process_name = if QueryFullProcessImageNameW(
+        process_handle,
+        windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+        PWSTR(exe_path.as_mut_ptr()),
+        &mut size,
+    )
+    .is_ok()
+    {
+        let path = String::from_utf16_lossy(&exe_path[..size as usize]);
+        let filename = path.split('\\').last().unwrap_or("").to_lowercase();
+        if filename.trim().is_empty() {
+            return None;
+        }
+
+        Some(filename)
+    } else {
+        None
+    };
+
+    let _ = CloseHandle(process_handle);
+    process_name
+}
+
 unsafe fn get_window_title(hwnd: HWND) -> Option<String> {
     let mut title = [0u16; 256];
     let len = GetWindowTextW(hwnd, &mut title);
@@ -664,6 +711,19 @@ unsafe fn is_game_process(hwnd: HWND) -> bool {
         return CACHED_GAME_STATE;
     }
 
+    let config = CONFIG.get().unwrap();
+    if let Some(game_mode_detection_excluded_processes) =
+        &config.game_mode_detection_excluded_processes
+    {
+        if game_mode_detection_excluded_processes.len() != 0 {
+            if let Some(process_name) = get_process_name(hwnd) {
+                if game_mode_detection_excluded_processes.contains(&process_name) {
+                    return false;
+                }
+            }
+        }
+    }
+
     if let Ok(state) = SHQueryUserNotificationState() {
         return state == QUNS_RUNNING_D3D_FULL_SCREEN;
     }
@@ -672,6 +732,11 @@ unsafe fn is_game_process(hwnd: HWND) -> bool {
 }
 
 unsafe fn start_gamemode_check_timer() {
+    let config = CONFIG.get().unwrap();
+    if !config.game_mode_detection_enabled {
+        return;
+    }
+
     if TIMER_WINDOW.0 != 0 {
         let _ = SetTimer(
             TIMER_WINDOW,
@@ -682,7 +747,6 @@ unsafe fn start_gamemode_check_timer() {
     }
 }
 
-#[inline]
 unsafe fn stop_gamemode_check_timer() {
     if TIMER_WINDOW.0 != 0 {
         let _ = KillTimer(TIMER_WINDOW, GAMEMODE_CHECK_TIMER_ID);
@@ -691,8 +755,8 @@ unsafe fn stop_gamemode_check_timer() {
 
 unsafe fn handle_inertia_timer() {
     let config = CONFIG.get().unwrap();
-
-    if !RUNNING.load(Ordering::SeqCst)
+    if !config.inertia_enabled
+        || !RUNNING.load(Ordering::SeqCst)
         || !INERTIA_ACTIVE.load(Ordering::SeqCst)
         || INERTIA_MOMENTUM.abs() <= config.inertia_threshold
         || GAME_MODE_DETECTED.load(Ordering::SeqCst)
@@ -840,12 +904,14 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
         MAX_SCROLL_MOMENTUM = SCROLL_MOMENTUM
     }
 
-    if SCROLL_MOMENTUM >= config.min_momentum_for_inertia {
-        if prev_max_scroll_momentum != MAX_SCROLL_MOMENTUM {
-            INERTIA_MOMENTUM = MAX_SCROLL_MOMENTUM;
-            INERTIA_DECAY_RATE = INERTIA_MOMENTUM.min(0.9)
+    if config.inertia_enabled {
+        if SCROLL_MOMENTUM >= config.min_momentum_for_inertia {
+            if prev_max_scroll_momentum != MAX_SCROLL_MOMENTUM {
+                INERTIA_MOMENTUM = MAX_SCROLL_MOMENTUM;
+                INERTIA_DECAY_RATE = INERTIA_MOMENTUM.min(0.9)
+            }
+            accumulate_inertia(SCROLL_MOMENTUM, current_direction);
         }
-        accumulate_inertia(SCROLL_MOMENTUM, current_direction);
     }
 
     true
