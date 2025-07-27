@@ -1,7 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::CStr;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -25,6 +29,32 @@ use windows::{
     Win32::{Foundation::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*},
 };
 
+#[derive(Debug, Deserialize, Serialize)]
+struct Config {
+    #[serde(rename = "ignoredProcesses")]
+    ignored_processes: Option<Vec<String>>,
+    #[serde(rename = "ignoredClassPatterns")]
+    ignored_class_patterns: Option<Vec<String>>,
+    #[serde(rename = "baseMultiplier")]
+    base_multiplier: Option<f64>,
+    #[serde(rename = "maxMultiplier")]
+    max_multiplier: Option<f64>,
+    #[serde(rename = "resetTimeoutMs")]
+    reset_timeout_ms: Option<u64>,
+    #[serde(rename = "inertiaBaseDecay")]
+    inertia_base_decay: Option<f64>,
+    #[serde(rename = "inertiaThreshold")]
+    inertia_threshold: Option<f64>,
+    #[serde(rename = "inertiaIntervalMs")]
+    inertia_interval_ms: Option<u32>,
+    #[serde(rename = "minMomentumForInertia")]
+    min_momentum_for_inertia: Option<f64>,
+    #[serde(rename = "inertiaAccumulationFactor")]
+    inertia_accumulation_factor: Option<f64>,
+    #[serde(rename = "maxInertiaMomentum")]
+    max_inertia_momentum: Option<f64>,
+}
+
 struct IgnoredClassPattern {
     title: Option<String>,
     class: String,
@@ -32,7 +62,7 @@ struct IgnoredClassPattern {
     class_hash: u64,
 }
 
-const IGNORED_PROCESSES: &[&str] = &[
+const DEFAULT_IGNORED_PROCESSES: &[&str] = &[
     "virtual pc.exe",
     "startmenuexperiencehost.exe",
     "searchapp.exe",
@@ -47,11 +77,7 @@ const IGNORED_PROCESSES: &[&str] = &[
     "sihost.exe",
 ];
 
-static IGNORED_CLASS_PATTERNS_COMPILED: OnceLock<(HashSet<u64>, Vec<IgnoredClassPattern>)> =
-    OnceLock::new();
-
-// format: window title|classname
-const IGNORED_CLASS_PATTERNS: &[&str] = &[
+const DEFAULT_IGNORED_CLASS_PATTERNS: &[&str] = &[
     "Program Manager|Progman",
     "*|MultitaskingViewFrame",
     "Volume Control|Tray Volume",
@@ -66,26 +92,57 @@ const IGNORED_CLASS_PATTERNS: &[&str] = &[
     "*|TSSHELLWND",
 ];
 
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
+static IGNORED_CLASS_PATTERNS_COMPILED: OnceLock<(HashSet<u64>, Vec<IgnoredClassPattern>)> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    ignored_processes: Vec<String>,
+    ignored_class_patterns: Vec<String>,
+    base_multiplier: f64,
+    max_multiplier: f64,
+    reset_timeout_ms: u64,
+    inertia_base_decay: f64,
+    inertia_threshold: f64,
+    inertia_interval_ms: u32,
+    min_momentum_for_inertia: f64,
+    inertia_accumulation_factor: f64,
+    max_inertia_momentum: f64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            ignored_processes: DEFAULT_IGNORED_PROCESSES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ignored_class_patterns: DEFAULT_IGNORED_CLASS_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            base_multiplier: 1.0,
+            max_multiplier: 3.0,
+            reset_timeout_ms: 50,
+            inertia_base_decay: 0.88,
+            inertia_threshold: 0.05,
+            inertia_interval_ms: 15,
+            min_momentum_for_inertia: 0.5,
+            inertia_accumulation_factor: 1.5,
+            max_inertia_momentum: 9.0,
+        }
+    }
+}
+
 const WHEEL_DELTA_F64: f64 = WHEEL_DELTA as f64;
-
-const BASE_MULTIPLIER: f64 = 1.0;
-const MAX_MULTIPLIER: f64 = 3.0;
-const RESET_TIMEOUT_MS: u64 = 50;
 const MAX_VELOCITY: u32 = WHEEL_DELTA;
-
-const INERTIA_BASE_DECAY: f64 = 0.88;
-const INERTIA_THRESHOLD: f64 = 0.05;
-const INERTIA_INTERVAL_MS: u32 = 15;
-const MIN_MOMENTUM_FOR_INERTIA: f64 = 0.5;
-const INERTIA_ACCUMULATION_FACTOR: f64 = 1.5;
-const MAX_INERTIA_MOMENTUM: f64 = 9.0;
+const GAMEMODE_CHECK_INTERVAL_MS: u32 = 1000;
 
 const INERTIA_TIMER_ID: usize = 1001;
 const GAMEMODE_CHECK_TIMER_ID: usize = 1002;
-const GAMEMODE_CHECK_INTERVAL_MS: u32 = 1000;
 
 static mut HOOK_HANDLE: HHOOK = HHOOK(0);
-
 static mut LAST_SCROLL_TIME: Option<Instant> = None;
 static mut SCROLL_MOMENTUM: f64 = 0.0;
 static mut MAX_SCROLL_MOMENTUM: f64 = 0.0;
@@ -98,7 +155,7 @@ thread_local! {
 
 static mut INERTIA_MOMENTUM: f64 = 0.0;
 static mut INERTIA_DIRECTION: i32 = 0;
-static mut INERTIA_DECAY_RATE: f64 = INERTIA_BASE_DECAY;
+static mut INERTIA_DECAY_RATE: f64 = 0.0;
 static mut LAST_WINDOW: HWND = HWND(0);
 static mut LAST_CURSOR_POS: POINT = POINT { x: 0, y: 0 };
 static mut INERTIA_PROGRESS: f64 = 0.0;
@@ -118,7 +175,120 @@ const GAME_CHECK_CACHE_DURATION_MS: u32 = GAMEMODE_CHECK_INTERVAL_MS;
 static mut WINDOW_CACHE: Option<HashMap<isize, (bool, Instant)>> = None;
 const CACHE_DURATION_MS: u64 = 100;
 
+fn load_config() -> AppConfig {
+    let args: Vec<String> = env::args().collect();
+    let mut config = AppConfig::default();
+
+    if let Some(config_index) = args.iter().position(|arg| arg == "--config" || arg == "-c") {
+        if let Some(config_path) = args.get(config_index + 1) {
+            if let Ok(config_str) = fs::read_to_string(config_path) {
+                match serde_json::from_str::<Config>(&config_str) {
+                    Ok(loaded_config) => {
+                        println!("Configuration loaded from: {}", config_path);
+
+                        if let Some(processes) = loaded_config.ignored_processes {
+                            let mut merged_processes = config.ignored_processes;
+                            for process in processes {
+                                if !merged_processes.contains(&process) {
+                                    merged_processes.push(process);
+                                }
+                            }
+
+                            config.ignored_processes = merged_processes;
+                            println!("ignored_processes: {}", config.ignored_processes.join(", "));
+                        }
+
+                        if let Some(patterns) = loaded_config.ignored_class_patterns {
+                            let mut merged_patterns = config.ignored_class_patterns;
+                            for pattern in patterns {
+                                if !merged_patterns.contains(&pattern) {
+                                    merged_patterns.push(pattern);
+                                }
+                            }
+
+                            config.ignored_class_patterns = merged_patterns;
+                            println!(
+                                "ignored_class_patterns: {}",
+                                config.ignored_class_patterns.join(", ")
+                            );
+                        }
+
+                        if let Some(val) = loaded_config.base_multiplier {
+                            config.base_multiplier = val;
+                            println!("base_multiplier: {}", config.base_multiplier);
+                        }
+
+                        if let Some(val) = loaded_config.max_multiplier {
+                            config.max_multiplier = val;
+                            println!("max_multiplier: {}", config.max_multiplier);
+                        }
+
+                        if let Some(val) = loaded_config.reset_timeout_ms {
+                            config.reset_timeout_ms = val;
+                            println!("reset_timeout_ms: {}", config.reset_timeout_ms);
+                        }
+
+                        if let Some(val) = loaded_config.inertia_base_decay {
+                            config.inertia_base_decay = val;
+                            println!("inertia_base_decay: {}", config.inertia_base_decay);
+                        }
+
+                        if let Some(val) = loaded_config.inertia_threshold {
+                            config.inertia_threshold = val;
+                            println!("inertia_threshold: {}", config.inertia_threshold);
+                        }
+
+                        if let Some(val) = loaded_config.inertia_interval_ms {
+                            config.inertia_interval_ms = val;
+                            println!("inertia_interval_ms: {}", config.inertia_interval_ms);
+                        }
+
+                        if let Some(val) = loaded_config.min_momentum_for_inertia {
+                            config.min_momentum_for_inertia = val;
+                            println!(
+                                "min_momentum_for_inertia: {}",
+                                config.min_momentum_for_inertia
+                            );
+                        }
+
+                        if let Some(val) = loaded_config.inertia_accumulation_factor {
+                            config.inertia_accumulation_factor = val;
+                            println!(
+                                "inertia_accumulation_factor: {}",
+                                config.inertia_accumulation_factor
+                            );
+                        }
+
+                        if let Some(val) = loaded_config.max_inertia_momentum {
+                            config.max_inertia_momentum = val;
+                            println!("max_inertia_momentum: {}", config.max_inertia_momentum);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error parsing config file '{}': {}", config_path, e);
+                        println!("Using default configuration");
+                    }
+                }
+            } else {
+                eprintln!("Error reading config file: {}", config_path);
+                println!("Using default configuration");
+            }
+        } else {
+            eprintln!("--config parameter provided but no file path specified");
+            println!("Using default configuration");
+        }
+    }
+
+    config
+}
+
 fn main() -> Result<()> {
+    let config = load_config();
+    let _ = CONFIG.set(config.clone());
+    unsafe {
+        INERTIA_DECAY_RATE = config.inertia_base_decay;
+    }
+
     compile_class_patterns();
 
     ctrlc::set_handler(move || {
@@ -158,10 +328,11 @@ fn main() -> Result<()> {
 }
 
 fn compile_class_patterns() {
+    let config = CONFIG.get().unwrap();
     let mut wildcard_classes = HashSet::new();
     let mut specific_patterns = Vec::new();
 
-    for pattern in IGNORED_CLASS_PATTERNS {
+    for pattern in &config.ignored_class_patterns {
         if let Some((title_part, class_part)) = pattern.split_once('|') {
             let class_hash = hash_string(class_part);
 
@@ -320,6 +491,7 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
         return cache;
     }
 
+    let config = CONFIG.get().unwrap();
     let mut process_id = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut process_id));
     if process_id != 0 {
@@ -346,7 +518,10 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
             let path = String::from_utf16_lossy(&exe_path[..size as usize]);
             let filename = path.split('\\').last().unwrap_or("").to_lowercase();
 
-            IGNORED_PROCESSES.contains(&filename.as_str())
+            config
+                .ignored_processes
+                .iter()
+                .any(|p| p.to_lowercase() == filename)
         } else {
             false
         };
@@ -441,9 +616,11 @@ unsafe fn stop_gamemode_check_timer() {
 }
 
 unsafe fn handle_inertia_timer() {
+    let config = CONFIG.get().unwrap();
+
     if !RUNNING.load(Ordering::SeqCst)
         || !INERTIA_ACTIVE.load(Ordering::SeqCst)
-        || INERTIA_MOMENTUM.abs() <= INERTIA_THRESHOLD
+        || INERTIA_MOMENTUM.abs() <= config.inertia_threshold
         || GAME_MODE_DETECTED.load(Ordering::SeqCst)
     {
         stop_inertia_timer();
@@ -459,15 +636,21 @@ unsafe fn handle_inertia_timer() {
     }
 
     INERTIA_MOMENTUM *= INERTIA_DECAY_RATE;
-    if inertia_delta == 0 || INERTIA_MOMENTUM.abs() <= INERTIA_THRESHOLD {
+    if inertia_delta == 0 || INERTIA_MOMENTUM.abs() <= config.inertia_threshold {
         stop_inertia_timer();
     }
 }
 
 #[inline]
 unsafe fn start_inertia_timer() {
+    let config = CONFIG.get().unwrap();
     if TIMER_WINDOW.0 != 0 {
-        let _ = SetTimer(TIMER_WINDOW, INERTIA_TIMER_ID, INERTIA_INTERVAL_MS, None);
+        let _ = SetTimer(
+            TIMER_WINDOW,
+            INERTIA_TIMER_ID,
+            config.inertia_interval_ms,
+            None,
+        );
     }
 }
 
@@ -534,6 +717,7 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
         return false;
     }
 
+    let config = CONFIG.get().unwrap();
     let current_time = Instant::now();
     let current_direction = if wheel_delta > 0 { 1 } else { -1 };
     let actual_time_since_last = match LAST_SCROLL_TIME {
@@ -549,7 +733,9 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
         VELOCITY_INDEX = 0;
     }
 
-    if actual_time_since_last > RESET_TIMEOUT_MS as f64 || current_direction != LAST_DIRECTION {
+    if actual_time_since_last > config.reset_timeout_ms as f64
+        || current_direction != LAST_DIRECTION
+    {
         SCROLL_MOMENTUM = 0.0;
         MAX_SCROLL_MOMENTUM = 0.0;
         SCROLL_VELOCITIES.set([0.0; 8]);
@@ -580,7 +766,7 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
         MAX_SCROLL_MOMENTUM = SCROLL_MOMENTUM
     }
 
-    if SCROLL_MOMENTUM >= MIN_MOMENTUM_FOR_INERTIA {
+    if SCROLL_MOMENTUM >= config.min_momentum_for_inertia {
         if prev_max_scroll_momentum != MAX_SCROLL_MOMENTUM {
             INERTIA_MOMENTUM = MAX_SCROLL_MOMENTUM;
             INERTIA_DECAY_RATE = INERTIA_MOMENTUM.min(0.9)
@@ -592,6 +778,7 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
 }
 
 unsafe fn get_acceleration_multiplier() -> f64 {
+    let config = CONFIG.get().unwrap();
     let velocities = SCROLL_VELOCITIES.get();
     let avg_velocity = velocities.iter().sum::<f64>() / velocities.len() as f64;
     let velocity_trend = if velocities.len() >= 3 {
@@ -606,7 +793,8 @@ unsafe fn get_acceleration_multiplier() -> f64 {
     let velocity_factor = (avg_velocity / MAX_VELOCITY as f64).min(1.0);
     let trend_factor = velocity_trend.min(0.5);
     let total_factor = velocity_factor * 0.7 + trend_factor * 0.3;
-    let multiplier = BASE_MULTIPLIER + (MAX_MULTIPLIER - BASE_MULTIPLIER) * total_factor;
+    let multiplier =
+        config.base_multiplier + (config.max_multiplier - config.base_multiplier) * total_factor;
     multiplier
 }
 
@@ -639,9 +827,10 @@ unsafe fn send_accelerated_scroll(original_delta: i32, multiplier: f64) {
 }
 
 unsafe fn accumulate_inertia(momentum: f64, direction: i32) {
+    let config = CONFIG.get().unwrap();
     if INERTIA_ACTIVE.load(Ordering::SeqCst) && INERTIA_DIRECTION == direction {
-        let new_inertia = momentum * INERTIA_ACCUMULATION_FACTOR;
-        INERTIA_MOMENTUM = (INERTIA_MOMENTUM + new_inertia).min(MAX_INERTIA_MOMENTUM);
+        let new_inertia = momentum * config.inertia_accumulation_factor;
+        INERTIA_MOMENTUM = (INERTIA_MOMENTUM + new_inertia).min(config.max_inertia_momentum);
     } else {
         start_inertia(direction);
     }
@@ -664,12 +853,13 @@ unsafe fn send_inertia_scroll(delta: i32) {
         return;
     }
 
+    let config = CONFIG.get().unwrap();
     let current_time = Instant::now();
     let actual_time_since_last = match LAST_SCROLL_TIME {
         Some(last_time) => current_time.duration_since(last_time).as_millis() as f64,
         None => f64::MAX,
     };
-    if actual_time_since_last < INERTIA_INTERVAL_MS.into() {
+    if actual_time_since_last < config.inertia_interval_ms.into() {
         return;
     }
 
