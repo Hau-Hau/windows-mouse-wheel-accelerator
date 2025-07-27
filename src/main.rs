@@ -282,7 +282,81 @@ fn load_config() -> AppConfig {
     config
 }
 
+unsafe fn kill_other_instances() -> Result<()> {
+    let current_process_id = GetCurrentProcessId();
+    let current_handle = GetCurrentProcess();
+    let mut current_exe_path = [0u16; 260];
+    let mut size = current_exe_path.len() as u32;
+    if QueryFullProcessImageNameW(
+        current_handle,
+        windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+        PWSTR(current_exe_path.as_mut_ptr()),
+        &mut size,
+    )
+    .is_err()
+    {
+        return Ok(());
+    }
+
+    let current_exe_name = String::from_utf16_lossy(&current_exe_path[..size as usize])
+        .split('\\')
+        .last()
+        .unwrap_or("")
+        .to_lowercase();
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
+    if snapshot.is_invalid() {
+        return Err(Error::from_win32());
+    }
+
+    let mut process_entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    if Process32FirstW(snapshot, &mut process_entry).is_err() {
+        let _ = CloseHandle(snapshot);
+        return Ok(());
+    }
+
+    let mut processes_to_kill = Vec::new();
+    loop {
+        if process_entry.th32ProcessID != current_process_id {
+            let process_name = String::from_utf16_lossy(
+                &process_entry.szExeFile[..process_entry
+                    .szExeFile
+                    .iter()
+                    .position(|&x| x == 0)
+                    .unwrap_or(process_entry.szExeFile.len())],
+            )
+            .to_lowercase();
+
+            if process_name == current_exe_name {
+                processes_to_kill.push(process_entry.th32ProcessID);
+            }
+        }
+
+        if Process32NextW(snapshot, &mut process_entry).is_err() {
+            break;
+        }
+    }
+
+    let _ = CloseHandle(snapshot);
+    for process_id in processes_to_kill {
+        if let Ok(process_handle) = OpenProcess(PROCESS_TERMINATE, false, process_id) {
+            let _ = TerminateProcess(process_handle, 0);
+            let _ = CloseHandle(process_handle);
+            println!("Terminated previous instance with PID: {}", process_id);
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    unsafe {
+        let _ = kill_other_instances();
+    }
+
     let config = load_config();
     let _ = CONFIG.set(config.clone());
     unsafe {
