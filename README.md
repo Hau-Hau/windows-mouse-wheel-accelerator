@@ -54,7 +54,7 @@ Values of ignoredProcesses and ignoredClassPatterns don't have to be specified e
         "dwm.exe",
         "sihost.exe"
     ],
-    // format: <window title>|class
+    // format: <window title>|<class name>
     "ignoredClassPatterns": [
         "Program Manager|Progman",
         "*|MultitaskingViewFrame",
