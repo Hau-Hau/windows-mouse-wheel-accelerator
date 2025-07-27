@@ -10,6 +10,7 @@ Low effort Win32 program to accelerate mouse wheel with inertia.
 - Accelerated scroll
 - Inertia effect for smooth scrolling
 - Configurable through json
+- Basic game mode detection - automatically disables acceleration in fullscreen Direct3D applications  
 
 ## Usage
 You can run the program in several ways:
