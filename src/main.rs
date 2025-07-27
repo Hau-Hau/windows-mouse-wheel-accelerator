@@ -1,7 +1,8 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -22,6 +23,47 @@ use windows::{
     Win32::UI::WindowsAndMessaging::WNDCLASSEXW,
     Win32::{Foundation::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*},
 };
+
+struct IgnoredClassPattern {
+    title: Option<String>,
+    class: String,
+    title_hash: Option<u64>,
+    class_hash: u64,
+}
+
+const IGNORED_PROCESSES: &[&str] = &[
+    "virtual pc.exe",
+    "startmenuexperiencehost.exe",
+    "searchapp.exe",
+    "searchui.exe",
+    "osk.exe",
+    "shellexperiencehost.exe",
+    "cortana.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+    "winlogon.exe",
+    "dwm.exe",
+    "sihost.exe",
+];
+
+static IGNORED_CLASS_PATTERNS_COMPILED: OnceLock<(HashSet<u64>, Vec<IgnoredClassPattern>)> =
+    OnceLock::new();
+
+// format: window title|classname
+const IGNORED_CLASS_PATTERNS: &[&str] = &[
+    "Program Manager|Progman",
+    "*|MultitaskingViewFrame",
+    "Volume Control|Tray Volume",
+    "Volume Control|Windows.UI.Core.CoreWindow",
+    "*|TaskSwitcherWnd",
+    "*|TaskSwitcherOverlayWnd",
+    "*|WorkerW",
+    "*|Shell_TrayWnd",
+    "*|BaseBar",
+    "*|#32768",
+    "*|XamlExplorerHostIslandWindow",
+    "*|TSSHELLWND",
+];
 
 const WHEEL_DELTA_F64: f64 = WHEEL_DELTA as f64;
 
@@ -72,7 +114,12 @@ static mut CACHED_GAME_STATE: bool = false;
 static mut CACHED_WINDOW: HWND = HWND(0);
 const GAME_CHECK_CACHE_DURATION_MS: u32 = GAMEMODE_CHECK_INTERVAL_MS;
 
+static mut WINDOW_CACHE: Option<HashMap<isize, (bool, Instant)>> = None;
+const CACHE_DURATION_MS: u64 = 100;
+
 fn main() -> Result<()> {
+    compile_class_patterns();
+
     ctrlc::set_handler(move || {
         RUNNING.store(false, Ordering::SeqCst);
         unsafe {
@@ -107,6 +154,39 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn compile_class_patterns() {
+    let mut wildcard_classes = HashSet::new();
+    let mut specific_patterns = Vec::new();
+
+    for pattern in IGNORED_CLASS_PATTERNS {
+        if let Some((title_part, class_part)) = pattern.split_once('|') {
+            let class_hash = hash_string(class_part);
+
+            if title_part == "*" {
+                wildcard_classes.insert(class_hash);
+            } else {
+                specific_patterns.push(IgnoredClassPattern {
+                    title: Some(title_part.to_string()),
+                    class: class_part.to_string(),
+                    title_hash: Some(hash_string(title_part)),
+                    class_hash,
+                });
+            }
+        }
+    }
+
+    let _ = IGNORED_CLASS_PATTERNS_COMPILED.set((wildcard_classes, specific_patterns));
+}
+
+fn hash_string(s: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 unsafe fn create_timer_window() -> Result<()> {
@@ -200,6 +280,127 @@ unsafe fn handle_gamemode_check() {
         LAST_FOREGROUND_WINDOW = foreground_window;
         LAST_GAME_CHECK_TIME = Some(current_time);
         CACHED_WINDOW = foreground_window;
+    }
+}
+
+unsafe fn is_window_cached(hwnd: HWND) -> Option<bool> {
+    let cache = WINDOW_CACHE.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    if let Some((is_ignored, cached_time)) = cache.get(&hwnd.0) {
+        if now.duration_since(*cached_time).as_millis() < CACHE_DURATION_MS.into() {
+            return Some(*is_ignored);
+        } else {
+            cache.remove(&hwnd.0);
+        }
+    }
+
+    static mut CLEANUP_COUNTER: u32 = 0;
+    CLEANUP_COUNTER += 1;
+    if CLEANUP_COUNTER % 1000 == 0 {
+        cache.retain(|_, (_, time)| {
+            now.duration_since(*time).as_millis() < CACHE_DURATION_MS.into()
+        });
+    }
+
+    None
+}
+
+unsafe fn cache_window_result(hwnd: HWND, is_ignored: bool) {
+    let cache = WINDOW_CACHE.get_or_insert_with(HashMap::new);
+    cache.insert(hwnd.0, (is_ignored, Instant::now()));
+}
+
+unsafe fn is_window_ignored(hwnd: HWND) -> bool {
+    if hwnd.0 == 0 {
+        return false;
+    }
+
+    if let Some(cache) = is_window_cached(hwnd) {
+        return cache;
+    }
+
+    let mut process_id = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    if process_id != 0 {
+        let process_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+        {
+            Ok(handle) => handle,
+            Err(_) => {
+                cache_window_result(hwnd, false);
+                return false;
+            }
+        };
+
+        let mut exe_path = [0u16; 260];
+        let mut size = exe_path.len() as u32;
+
+        let process_check_result = if QueryFullProcessImageNameW(
+            process_handle,
+            windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+            PWSTR(exe_path.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok()
+        {
+            let path = String::from_utf16_lossy(&exe_path[..size as usize]);
+            let filename = path.split('\\').last().unwrap_or("").to_lowercase();
+
+            IGNORED_PROCESSES.contains(&filename.as_str())
+        } else {
+            false
+        };
+
+        let _ = CloseHandle(process_handle);
+        if process_check_result {
+            cache_window_result(hwnd, process_check_result);
+            return process_check_result;
+        }
+    }
+
+    let mut class_name = [0u16; 256];
+    let len = GetClassNameW(hwnd, &mut class_name);
+    if len == 0 {
+        cache_window_result(hwnd, false);
+        return false;
+    }
+
+    let class_str = String::from_utf16_lossy(&class_name[..len as usize]);
+    let class_hash = hash_string(&class_str);
+
+    if let Some((wildcard_classes, specific_patterns)) = IGNORED_CLASS_PATTERNS_COMPILED.get() {
+        if wildcard_classes.contains(&class_hash) {
+            cache_window_result(hwnd, true);
+            return true;
+        }
+
+        for pattern in specific_patterns {
+            if pattern.class_hash == class_hash && pattern.class == class_str {
+                if let Some(title_hash) = pattern.title_hash {
+                    let window_title = get_window_title(hwnd);
+                    if let Some(title) = window_title {
+                        if hash_string(&title) == title_hash
+                            && title == *pattern.title.as_ref().unwrap()
+                        {
+                            cache_window_result(hwnd, true);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    cache_window_result(hwnd, false);
+    false
+}
+
+unsafe fn get_window_title(hwnd: HWND) -> Option<String> {
+    let mut title = [0u16; 256];
+    let len = GetWindowTextW(hwnd, &mut title);
+    if len > 0 {
+        Some(String::from_utf16_lossy(&title[..len as usize]))
+    } else {
+        None
     }
 }
 
@@ -309,8 +510,10 @@ unsafe extern "system" fn low_level_mouse_proc(
                 let _ = GetCursorPos(&raw mut LAST_CURSOR_POS);
                 LAST_WINDOW = WindowFromPoint(LAST_CURSOR_POS);
 
-                if process_scroll_input(wheel_delta) {
-                    return LRESULT(1);
+                if !is_window_ignored(LAST_WINDOW) {
+                    if process_scroll_input(wheel_delta) {
+                        return LRESULT(1);
+                    }
                 }
             }
             _ => {}
@@ -489,5 +692,9 @@ unsafe fn cleanup() {
 
     if TIMER_WINDOW.0 != 0 {
         let _ = DestroyWindow(TIMER_WINDOW);
+    }
+
+    if let Some(cache) = WINDOW_CACHE.as_mut() {
+        cache.clear();
     }
 }
