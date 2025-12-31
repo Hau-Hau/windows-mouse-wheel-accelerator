@@ -765,6 +765,15 @@ unsafe fn handle_inertia_timer() {
         return;
     }
 
+    let mut current_pos = POINT::default();
+    if GetCursorPos(&mut current_pos).is_ok() {
+        let current_window = WindowFromPoint(current_pos);
+        if current_window != LAST_WINDOW {
+            stop_inertia_timer();
+            return;
+        }
+    }
+
     INERTIA_PROGRESS += 16.0 / 1000.0;
     let base_delta = WHEEL_DELTA as f64 * INERTIA_DIRECTION as f64;
     let inertia_delta = (base_delta * INERTIA_MOMENTUM) as i32;
