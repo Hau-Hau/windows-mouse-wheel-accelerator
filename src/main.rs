@@ -567,8 +567,12 @@ unsafe fn handle_gamemode_check() {
 }
 
 unsafe fn is_window_cached(hwnd: HWND) -> Option<bool> {
-    let cache = WINDOW_CACHE.get_or_insert_with(HashMap::new);
     let now = Instant::now();
+    let cache_ptr = std::ptr::addr_of_mut!(WINDOW_CACHE);
+    if (*cache_ptr).is_none() {
+        *cache_ptr = Some(HashMap::new());
+    }
+    let cache = (*cache_ptr).as_mut().unwrap();
     if let Some((is_ignored, cached_time)) = cache.get(&hwnd.0) {
         if now.duration_since(*cached_time).as_millis() < CACHE_DURATION_MS.into() {
             return Some(*is_ignored);
@@ -589,7 +593,12 @@ unsafe fn is_window_cached(hwnd: HWND) -> Option<bool> {
 }
 
 unsafe fn cache_window_result(hwnd: HWND, is_ignored: bool) {
-    let cache = WINDOW_CACHE.get_or_insert_with(HashMap::new);
+    let cache_ptr = std::ptr::addr_of_mut!(WINDOW_CACHE);
+    if (*cache_ptr).is_none() {
+        *cache_ptr = Some(HashMap::new());
+    }
+
+    let cache = (*cache_ptr).as_mut().unwrap();
     cache.insert(hwnd.0, (is_ignored, Instant::now()));
 }
 
@@ -1034,7 +1043,9 @@ unsafe fn cleanup() {
         let _ = DestroyWindow(TIMER_WINDOW);
     }
 
-    if let Some(cache) = WINDOW_CACHE.as_mut() {
+    let cache_ptr = std::ptr::addr_of_mut!(WINDOW_CACHE);
+    if (*cache_ptr).is_some() {
+        let cache = (*cache_ptr).as_mut().unwrap();
         cache.clear();
     }
 }
