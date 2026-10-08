@@ -616,7 +616,7 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
         if config
             .ignored_processes
             .iter()
-            .any(|p| p.to_lowercase() == process_name)
+            .any(|p| p.eq_ignore_ascii_case(&process_name))
         {
             cache_window_result(hwnd, true);
             return true;
@@ -726,7 +726,10 @@ unsafe fn is_game_process(hwnd: HWND) -> bool {
     {
         if game_mode_detection_excluded_processes.len() != 0 {
             if let Some(process_name) = get_process_name(hwnd) {
-                if game_mode_detection_excluded_processes.contains(&process_name) {
+                if game_mode_detection_excluded_processes
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&process_name))
+                {
                     return false;
                 }
             }
