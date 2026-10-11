@@ -6,15 +6,17 @@ use std::env;
 use std::ffi::CStr;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 use windows::{
-    core::*,
     Win32::Graphics::Direct3D9::*,
     Win32::Graphics::Gdi::HBRUSH,
     Win32::Storage::FileSystem::*,
@@ -27,6 +29,7 @@ use windows::{
     Win32::UI::WindowsAndMessaging::DefWindowProcW,
     Win32::UI::WindowsAndMessaging::WNDCLASSEXW,
     Win32::{Foundation::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*},
+    core::*,
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -101,6 +104,63 @@ const DEFAULT_IGNORED_CLASS_PATTERNS: &[&str] = &[
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 static IGNORED_CLASS_PATTERNS_COMPILED: OnceLock<(HashSet<u64>, Vec<IgnoredClassPattern>)> =
     OnceLock::new();
+static IGNORED_PROCESSES_COMPILED: OnceLock<Vec<ProcessPattern>> = OnceLock::new();
+static GAME_MODE_EXCLUDED_PROCESSES_COMPILED: OnceLock<Vec<ProcessPattern>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct ProcessPattern {
+    original: String,
+    is_wildcard: bool,
+    parts: Vec<String>,
+}
+
+impl ProcessPattern {
+    fn new(pattern: &str) -> Self {
+        let lowercase_pattern = pattern.to_lowercase();
+        let is_wildcard = lowercase_pattern.contains('*');
+        let parts = lowercase_pattern
+            .split('*')
+            .map(|s| s.to_string())
+            .collect();
+
+        Self {
+            original: lowercase_pattern,
+            is_wildcard,
+            parts,
+        }
+    }
+
+    fn is_match(&self, target: &str) -> bool {
+        if !self.is_wildcard {
+            // Fast path for exact matches
+            return self.original.eq_ignore_ascii_case(target);
+        }
+
+        let target = target.to_lowercase();
+        if self.parts.is_empty() {
+            return false;
+        }
+        if !target.starts_with(&self.parts[0]) {
+            return false;
+        }
+        let mut current_pos = self.parts[0].len();
+        for part in &self.parts[1..self.parts.len() - 1] {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(idx) = target[current_pos..].find(part) {
+                current_pos += idx + part.len();
+            } else {
+                return false;
+            }
+        }
+        let last = self.parts.last().unwrap();
+        if !last.is_empty() && !target[current_pos..].ends_with(last) {
+            return false;
+        }
+        true
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AppConfig {
@@ -147,6 +207,7 @@ impl Default for AppConfig {
     }
 }
 
+const LLMHF_INJECTED_FLAG: u32 = 0x00000001;
 const WHEEL_DELTA_F64: f64 = WHEEL_DELTA as f64;
 const MAX_VELOCITY: u32 = WHEEL_DELTA;
 const GAMEMODE_CHECK_INTERVAL_MS: u32 = 1000;
@@ -401,6 +462,7 @@ fn main() -> Result<()> {
     }
 
     compile_class_patterns();
+    compile_process_patterns();
 
     ctrlc::set_handler(move || {
         RUNNING.store(false, Ordering::SeqCst);
@@ -461,6 +523,22 @@ fn compile_class_patterns() {
     }
 
     let _ = IGNORED_CLASS_PATTERNS_COMPILED.set((wildcard_classes, specific_patterns));
+}
+
+fn compile_process_patterns() {
+    let config = CONFIG.get().unwrap();
+
+    let ignored_processes = config
+        .ignored_processes
+        .iter()
+        .map(|p| ProcessPattern::new(p))
+        .collect();
+    let _ = IGNORED_PROCESSES_COMPILED.set(ignored_processes);
+
+    if let Some(excluded) = &config.game_mode_detection_excluded_processes {
+        let excluded_processes = excluded.iter().map(|p| ProcessPattern::new(p)).collect();
+        let _ = GAME_MODE_EXCLUDED_PROCESSES_COMPILED.set(excluded_processes);
+    }
 }
 
 fn hash_string(s: &str) -> u64 {
@@ -611,15 +689,15 @@ unsafe fn is_window_ignored(hwnd: HWND) -> bool {
         return cache;
     }
 
-    let config = CONFIG.get().unwrap();
     if let Some(process_name) = get_process_name(hwnd) {
-        if config
-            .ignored_processes
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(&process_name))
-        {
-            cache_window_result(hwnd, true);
-            return true;
+        if let Some(compiled_patterns) = IGNORED_PROCESSES_COMPILED.get() {
+            if compiled_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(&process_name))
+            {
+                cache_window_result(hwnd, true);
+                return true;
+            }
         }
     }
 
@@ -720,15 +798,12 @@ unsafe fn is_game_process(hwnd: HWND) -> bool {
         return CACHED_GAME_STATE;
     }
 
-    let config = CONFIG.get().unwrap();
-    if let Some(game_mode_detection_excluded_processes) =
-        &config.game_mode_detection_excluded_processes
-    {
-        if game_mode_detection_excluded_processes.len() != 0 {
+    if let Some(compiled_excluded) = GAME_MODE_EXCLUDED_PROCESSES_COMPILED.get() {
+        if !compiled_excluded.is_empty() {
             if let Some(process_name) = get_process_name(hwnd) {
-                if game_mode_detection_excluded_processes
+                if compiled_excluded
                     .iter()
-                    .any(|p| p.eq_ignore_ascii_case(&process_name))
+                    .any(|pattern| pattern.is_match(&process_name))
                 {
                     return false;
                 }
