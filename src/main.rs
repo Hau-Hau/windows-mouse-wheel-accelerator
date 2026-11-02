@@ -243,6 +243,7 @@ static mut TIMER_WINDOW: HWND = HWND(0);
 static mut LAST_GAME_CHECK_TIME: Option<Instant> = None;
 static mut CACHED_GAME_STATE: bool = false;
 static mut CACHED_WINDOW: HWND = HWND(0);
+static mut ACTIVE_SCROLL_HWND: HWND = HWND(0);
 const GAME_CHECK_CACHE_DURATION_MS: u32 = GAMEMODE_CHECK_INTERVAL_MS;
 
 static mut WINDOW_CACHE: Option<HashMap<isize, (bool, Instant)>> = None;
@@ -951,6 +952,18 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
         return false;
     }
 
+    let mut cursor_pos = POINT::default();
+    if GetCursorPos(&mut cursor_pos).is_err() {
+        return false;
+    }
+
+    let current_hwnd = WindowFromPoint(cursor_pos);
+    if current_hwnd != ACTIVE_SCROLL_HWND {
+        // Reset momentum because the user switched windows mid-scroll
+        SCROLL_MOMENTUM = 0.0;
+        ACTIVE_SCROLL_HWND = current_hwnd;
+    }
+
     let config = CONFIG.get().unwrap();
     let current_time = Instant::now();
     let current_direction = if wheel_delta > 0 { 1 } else { -1 };
@@ -993,7 +1006,7 @@ unsafe fn process_scroll_input(wheel_delta: i32) -> bool {
     LAST_DIRECTION = current_direction;
 
     let acceleration_multiplier = get_acceleration_multiplier();
-    send_accelerated_scroll(wheel_delta, acceleration_multiplier);
+    send_accelerated_scroll(wheel_delta, acceleration_multiplier, cursor_pos);
 
     let prev_max_scroll_momentum = MAX_SCROLL_MOMENTUM;
     if SCROLL_MOMENTUM > MAX_SCROLL_MOMENTUM {
@@ -1040,12 +1053,7 @@ fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
-unsafe fn send_accelerated_scroll(original_delta: i32, multiplier: f64) {
-    let mut cursor_pos = POINT::default();
-    if GetCursorPos(&mut cursor_pos).is_err() {
-        return;
-    }
-
+unsafe fn send_accelerated_scroll(original_delta: i32, multiplier: f64, cursor_pos: POINT) {
     let hwnd = WindowFromPoint(cursor_pos);
     if hwnd.0 == 0 {
         return;
